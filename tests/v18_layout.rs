@@ -37,3 +37,23 @@ async fn version_3_attribute_messages() {
     let scale = ds.attribute("scale_factor").await.unwrap();
     assert!(matches!(scale.value, AttributeValue::F32(ref v) if v == &[0.5]));
 }
+
+#[tokio::test]
+async fn dense_attributes() {
+    let file = open_fixture("v18_layout.h5").await;
+    let ds = file
+        .root_group()
+        .await
+        .unwrap()
+        .dataset("dense")
+        .await
+        .unwrap();
+    let attrs = ds.attributes().await;
+    assert_eq!(attrs.len(), 13);
+    for i in 0..12 {
+        let a = ds.attribute(&format!("attr_{i:02}")).await.unwrap();
+        assert_eq!(a.value.as_i32(), Some(i));
+    }
+    let long_name = ds.attribute("long_name").await.unwrap();
+    assert_eq!(long_name.value.as_str(), Some("dense attribute storage"));
+}

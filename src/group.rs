@@ -7,6 +7,7 @@ use crate::endian::HDF5Reader;
 use crate::error::{HDF5Error, Result};
 use crate::file::read_object_header;
 use crate::messages::attribute::{Attribute, AttributeMessage};
+use crate::messages::attribute_info::AttributeInfoMessage;
 use crate::messages::link::{LinkMessage, LinkType};
 use crate::messages::link_info::LinkInfoMessage;
 use crate::messages::symbol_table::SymbolTableMessage;
@@ -415,7 +416,9 @@ impl HDF5Group {
     }
 }
 
-/// Extract decoded attributes from inline attribute messages in an object header.
+/// Extract decoded attributes from an object header: compact attribute
+/// messages in the header, then dense attributes held in a fractal heap
+/// (an attribute info message, used from 8 attributes on by default).
 ///
 /// Resolves variable-length data (e.g., vlen strings) via the global heap.
 pub(crate) async fn attributes_from_header(
@@ -424,9 +427,24 @@ pub(crate) async fn attributes_from_header(
     size_of_offsets: u8,
     size_of_lengths: u8,
 ) -> Vec<Attribute> {
+    let mut messages: Vec<Bytes> = header
+        .find_messages(msg_types::ATTRIBUTE)
+        .into_iter()
+        .map(|msg| msg.data.clone())
+        .collect();
+    for msg in header.find_messages(msg_types::ATTRIBUTE_INFO) {
+        // A dense store that cannot be read loses its attributes, the same
+        // as a compact message that cannot be parsed.
+        if let Ok(dense) =
+            dense_attribute_messages(&msg.data, reader, size_of_offsets, size_of_lengths).await
+        {
+            messages.extend(dense);
+        }
+    }
+
     let mut attrs = Vec::new();
-    for msg in header.find_messages(msg_types::ATTRIBUTE) {
-        if let Ok(am) = AttributeMessage::parse(&msg.data, size_of_offsets, size_of_lengths) {
+    for data in &messages {
+        if let Ok(am) = AttributeMessage::parse(data, size_of_offsets, size_of_lengths) {
             match am
                 .to_attribute_resolved(reader, size_of_offsets, size_of_lengths)
                 .await
@@ -440,4 +458,62 @@ pub(crate) async fn attributes_from_header(
         }
     }
     attrs
+}
+
+/// The attribute messages of dense attribute storage, in name-index order.
+///
+/// Each record of the name-index v2 B-tree (record type 8) is a fractal
+/// heap id, a message flags byte, a creation order (u32) and a name hash
+/// (u32); the heap object is the attribute message.
+async fn dense_attribute_messages(
+    data: &Bytes,
+    reader: &Arc<dyn AsyncFileReader>,
+    size_of_offsets: u8,
+    size_of_lengths: u8,
+) -> Result<Vec<Bytes>> {
+    let info = AttributeInfoMessage::parse(data, size_of_offsets, size_of_lengths)?;
+    if HDF5Reader::is_undef_addr(info.fractal_heap_address, size_of_offsets)
+        || HDF5Reader::is_undef_addr(info.name_btree_address, size_of_offsets)
+    {
+        return Ok(vec![]);
+    }
+    let fheap = heap::fractal::FractalHeap::read(
+        reader,
+        info.fractal_heap_address,
+        size_of_offsets,
+        size_of_lengths,
+    )
+    .await?;
+    let btree_header = btree::v2::BTreeV2Header::read(
+        reader,
+        info.name_btree_address,
+        size_of_offsets,
+        size_of_lengths,
+    )
+    .await?;
+    if btree_header.record_type != 8 {
+        return Err(HDF5Error::General(format!(
+            "expected attribute name index (v2 B-tree record type 8), got {}",
+            btree_header.record_type
+        )));
+    }
+    let records =
+        btree::v2::collect_all_records(reader, &btree_header, size_of_offsets, size_of_lengths)
+            .await?;
+
+    let mut messages = Vec::with_capacity(records.len());
+    for record in &records {
+        // heap id, then flags (1), creation order (4) and hash (4).
+        let Some(id_len) = record.len().checked_sub(9) else {
+            continue;
+        };
+        let flags = record[id_len];
+        if flags & 0x02 != 0 {
+            // A shared attribute message lives in the shared message heap,
+            // which is not read yet.
+            continue;
+        }
+        messages.push(fheap.get_object(&record[..id_len]).await?);
+    }
+    Ok(messages)
 }
