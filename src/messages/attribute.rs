@@ -357,13 +357,14 @@ impl AttributeMessage {
         _size_of_offsets: u8,
         size_of_lengths: u8,
     ) -> Result<Self> {
-        // v3: same as v2 but with charset flag
-        let flags = r.read_u8()?;
+        // v3: same as v2 plus a name character set byte, which every
+        // version 3 message has (0 = ASCII, 1 = UTF-8).
+        let _flags = r.read_u8()?;
         let name_size = r.read_u16()? as usize;
         let datatype_size = r.read_u16()? as usize;
         let dataspace_size = r.read_u16()? as usize;
 
-        let _charset = if flags & 0x10 != 0 { r.read_u8()? } else { 0 };
+        let _charset = r.read_u8()?;
 
         let name_bytes = r.read_bytes(name_size)?;
         let name = String::from_utf8_lossy(&name_bytes)
