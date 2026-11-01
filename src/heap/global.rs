@@ -7,7 +7,7 @@ use crate::error::{HDF5Error, Result};
 use crate::reader::AsyncFileReader;
 
 /// Global Heap Collection signature.
-const GCOL_SIGNATURE: [u8; 4] = [b'G', b'C', b'O', b'L'];
+const GCOL_SIGNATURE: [u8; 4] = *b"GCOL";
 
 /// Read a single object from a global heap collection.
 ///

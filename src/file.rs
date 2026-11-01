@@ -220,7 +220,7 @@ fn peek_object_header_size(data: &Bytes) -> Result<u64> {
         ));
     }
 
-    if data.len() >= 4 && data[0..4] == [b'O', b'H', b'D', b'R'] {
+    if data.len() >= 4 && data[0..4] == *b"OHDR" {
         // v2 header
         let flags = data[5];
         let mut offset = 6usize;
