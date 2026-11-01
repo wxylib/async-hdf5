@@ -345,13 +345,9 @@ impl FractalHeap {
     /// Get a tiny object — data is embedded directly in the heap ID.
     fn get_tiny_object(&self, heap_id: &[u8]) -> Result<Bytes> {
         let first_byte = heap_id[0];
-        let data_length;
-        let data_start;
-
-        if self.id_length <= 18 {
+        let (data_length, data_start) = if self.id_length <= 18 {
             // Normal tiny: lower 4 bits = length - 1
-            data_length = ((first_byte & 0x0F) + 1) as usize;
-            data_start = 1;
+            (((first_byte & 0x0F) + 1) as usize, 1)
         } else {
             // Extended tiny: lower 4 bits = high nibble of 12-bit length-1
             let high = (first_byte & 0x0F) as usize;
@@ -359,8 +355,7 @@ impl FractalHeap {
                 return Err(HDF5Error::General("tiny heap ID too short".into()));
             }
             let low = heap_id[1] as usize;
-            data_length = ((high << 8) | low) + 1;
-            data_start = 2;
+            (((high << 8) | low) + 1, 2)
         };
 
         if heap_id.len() < data_start + data_length {
