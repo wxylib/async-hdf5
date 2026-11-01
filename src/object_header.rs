@@ -4,11 +4,11 @@ use crate::endian::HDF5Reader;
 use crate::error::{HDF5Error, Result};
 
 /// Object Header v2 signature.
-const OHDR_SIGNATURE: [u8; 4] = [b'O', b'H', b'D', b'R'];
+const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 
 /// Object Header Continuation signature (v2).
 #[allow(dead_code)]
-const OCHK_SIGNATURE: [u8; 4] = [b'O', b'C', b'H', b'K'];
+const OCHK_SIGNATURE: [u8; 4] = *b"OCHK";
 
 /// A raw header message (type + data bytes, not yet parsed into a specific message).
 #[derive(Debug, Clone)]
