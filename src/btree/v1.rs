@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::{stream, StreamExt, TryStreamExt};
+
 use crate::endian::HDF5Reader;
 use crate::error::{HDF5Error, Result};
 use crate::heap::local::LocalHeap;
@@ -218,9 +221,15 @@ async fn read_symbol_table_node(
     Ok(entries)
 }
 
+/// Index node reads in flight during a chunk B-tree walk, unless a caller
+/// sets another value.
+pub const DEFAULT_CHUNK_BTREE_CONCURRENCY: usize = 32;
+
 /// Traverse a v1 B-tree (type 1 — raw data chunks) and collect all chunk entries.
 ///
 /// `ndims` is the dimensionality of the dataset (needed to parse chunk keys).
+/// Reads [`DEFAULT_CHUNK_BTREE_CONCURRENCY`] nodes at a time; see
+/// [`read_chunk_btree_v1_with_concurrency`].
 pub async fn read_chunk_btree_v1(
     reader: &Arc<dyn AsyncFileReader>,
     btree_address: u64,
@@ -228,97 +237,117 @@ pub async fn read_chunk_btree_v1(
     size_of_offsets: u8,
     size_of_lengths: u8,
 ) -> Result<Vec<ChunkEntry>> {
-    let mut entries = Vec::new();
-    read_chunk_btree_node(
+    read_chunk_btree_v1_with_concurrency(
         reader,
         btree_address,
         ndims,
         size_of_offsets,
         size_of_lengths,
-        &mut entries,
+        DEFAULT_CHUNK_BTREE_CONCURRENCY,
     )
-    .await?;
-    Ok(entries)
+    .await
 }
 
-/// Recursively read a v1 B-tree node for chunk data.
-async fn read_chunk_btree_node(
+/// Traverse a v1 chunk B-tree one level at a time, reading up to
+/// `concurrency` nodes of a level at once.
+///
+/// A file written one record at a time (the usual netCDF-4 time series)
+/// spreads its index nodes through the whole file, so a walk that waits for
+/// each node pays one round trip per node. Walking by level pays one round
+/// trip per level. Entries come back in key order, the same as a
+/// depth-first walk.
+///
+/// Each node is read at its own size: a full node with K = 32 (libhdf5's
+/// default), read again whole if its entry count says it is bigger.
+pub async fn read_chunk_btree_v1_with_concurrency(
     reader: &Arc<dyn AsyncFileReader>,
-    address: u64,
+    btree_address: u64,
     ndims: usize,
     size_of_offsets: u8,
     size_of_lengths: u8,
-    entries: &mut Vec<ChunkEntry>,
-) -> Result<()> {
+    concurrency: usize,
+) -> Result<Vec<ChunkEntry>> {
     // Key size for type 1: 4 (size) + 4 (filter_mask) + (ndims+1)*8 (offsets)
     let key_size = 8 + (ndims + 1) * 8;
-    // Fetch enough for a large node
-    let fetch_size = (8
-        + 2 * size_of_offsets as usize
-        + 1024 * (key_size + size_of_offsets as usize))
-        .min(65536) as u64;
-    let data = reader.get_bytes(address..address + fetch_size).await?;
-    let mut r = HDF5Reader::with_sizes(data, size_of_offsets, size_of_lengths);
+    let offset_size = size_of_offsets as usize;
+    let header_size = 8 + 2 * offset_size;
+    let node_size =
+        |entries: usize| (header_size + (entries + 1) * key_size + entries * offset_size) as u64;
+    let guess = node_size(64);
 
-    r.read_signature(b"TREE")?;
-
-    let node_type = r.read_u8()?;
-    if node_type != 1 {
-        return Err(HDF5Error::General(format!(
-            "expected B-tree v1 node type 1 (chunk), got {node_type}"
-        )));
-    }
-
-    let node_level = r.read_u8()?;
-    let entries_used = r.read_u16()? as usize;
-    let _left_sibling = r.read_offset()?;
-    let _right_sibling = r.read_offset()?;
-
-    if node_level > 0 {
-        // Internal node
-        for _ in 0..entries_used {
-            // Skip key
-            r.skip(key_size as u64);
-            let child_address = r.read_offset()?;
-            Box::pin(read_chunk_btree_node(
-                reader,
-                child_address,
-                ndims,
-                size_of_offsets,
-                size_of_lengths,
-                entries,
-            ))
+    let mut level = vec![btree_address];
+    let mut entries = Vec::new();
+    let mut depth = 0;
+    while !level.is_empty() {
+        // Level 0 is a leaf; a tree deeper than this is a corrupt file.
+        if depth > 64 {
+            return Err(HDF5Error::General(
+                "chunk B-tree deeper than 64 levels".into(),
+            ));
+        }
+        let nodes: Vec<Bytes> = stream::iter(level)
+            .map(|address| async move {
+                let data = reader.get_bytes(address..address + guess).await?;
+                if data.len() >= header_size {
+                    let used = u16::from_le_bytes([data[6], data[7]]) as usize;
+                    if node_size(used) > data.len() as u64 {
+                        return reader.get_bytes(address..address + node_size(used)).await;
+                    }
+                }
+                Ok(data)
+            })
+            .buffered(concurrency.max(1))
+            .try_collect()
             .await?;
-        }
-        // Skip trailing key
-        r.skip(key_size as u64);
-    } else {
-        // Leaf node — collect chunk entries
-        for _ in 0..entries_used {
-            // Key: size(4) + filter_mask(4) + offsets((ndims+1) * 8)
-            let chunk_size = r.read_u32()?;
-            let filter_mask = r.read_u32()?;
-            let mut offsets = Vec::with_capacity(ndims);
-            for _ in 0..ndims {
-                offsets.push(r.read_u64()?);
-            }
-            let _zero = r.read_u64()?; // trailing dimension (always 0)
 
-            let child_address = r.read_offset()?;
+        let mut next = Vec::new();
+        for data in nodes {
+            let mut r = HDF5Reader::with_sizes(data, size_of_offsets, size_of_lengths);
+            r.read_signature(b"TREE")?;
 
-            // Skip entries with undefined address (unallocated chunks)
-            if !HDF5Reader::is_undef_addr(child_address, size_of_offsets) {
-                entries.push(ChunkEntry {
-                    size: chunk_size,
-                    filter_mask,
-                    offsets,
-                    address: child_address,
-                });
+            let node_type = r.read_u8()?;
+            if node_type != 1 {
+                return Err(HDF5Error::General(format!(
+                    "expected B-tree v1 node type 1 (chunk), got {node_type}"
+                )));
+            }
+
+            let node_level = r.read_u8()?;
+            let entries_used = r.read_u16()? as usize;
+            let _left_sibling = r.read_offset()?;
+            let _right_sibling = r.read_offset()?;
+
+            for _ in 0..entries_used {
+                if node_level > 0 {
+                    // Internal node: skip the key, keep the child.
+                    r.skip(key_size as u64);
+                    next.push(r.read_offset()?);
+                    continue;
+                }
+                // Leaf: size(4) + filter_mask(4) + offsets((ndims+1) * 8)
+                let chunk_size = r.read_u32()?;
+                let filter_mask = r.read_u32()?;
+                let mut offsets = Vec::with_capacity(ndims);
+                for _ in 0..ndims {
+                    offsets.push(r.read_u64()?);
+                }
+                let _zero = r.read_u64()?; // trailing dimension (always 0)
+
+                let child_address = r.read_offset()?;
+
+                // Skip entries with undefined address (unallocated chunks)
+                if !HDF5Reader::is_undef_addr(child_address, size_of_offsets) {
+                    entries.push(ChunkEntry {
+                        size: chunk_size,
+                        filter_mask,
+                        offsets,
+                        address: child_address,
+                    });
+                }
             }
         }
-        // Skip trailing key
-        r.skip(key_size as u64);
+        level = next;
+        depth += 1;
     }
-
-    Ok(())
+    Ok(entries)
 }

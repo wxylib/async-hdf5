@@ -43,6 +43,9 @@ pub struct HDF5Dataset {
 
     /// Cached chunk index (lazily resolved on first access).
     cached_chunk_index: OnceCell<ChunkIndex>,
+
+    /// Index node reads in flight while walking a v1 chunk B-tree.
+    index_concurrency: usize,
 }
 
 impl HDF5Dataset {
@@ -112,7 +115,17 @@ impl HDF5Dataset {
             filters,
             fill_value,
             cached_chunk_index: OnceCell::new(),
+            index_concurrency: btree::v1::DEFAULT_CHUNK_BTREE_CONCURRENCY,
         })
+    }
+
+    /// Set how many index nodes are read at once while walking a version 1
+    /// chunk B-tree (default
+    /// [`DEFAULT_CHUNK_BTREE_CONCURRENCY`](btree::v1::DEFAULT_CHUNK_BTREE_CONCURRENCY)).
+    /// Takes effect if set before the first [`chunk_index`](Self::chunk_index).
+    pub fn with_index_concurrency(mut self, concurrency: usize) -> Self {
+        self.index_concurrency = concurrency.max(1);
+        self
     }
 
     /// The dataset's name (not the full path).
@@ -274,12 +287,16 @@ impl HDF5Dataset {
     ) -> Result<ChunkIndex> {
         let ndims = self.shape.len();
 
-        let entries = btree::v1::read_chunk_btree_v1(
-            &self.reader,
+        // Nodes are read through the uncached reader, each at its own size:
+        // in a file written one record at a time they are spread through
+        // the whole file, and a block per node would fetch most of it.
+        let entries = btree::v1::read_chunk_btree_v1_with_concurrency(
+            &self.raw_reader,
             btree_address,
             ndims,
             self.superblock.size_of_offsets,
             self.superblock.size_of_lengths,
+            self.index_concurrency,
         )
         .await?;
 
